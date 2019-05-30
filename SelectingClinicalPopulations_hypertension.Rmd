@@ -1,0 +1,307 @@
+---
+title: "Selecting Clinical Populations"
+author: "Cristina Goldfain"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+library(DT)
+library(tidyverse)
+library(magrittr)
+library(bigrquery)
+library(caret)
+library(stringr)
+```
+
+```{r dbconnection, include=FALSE}
+con <- DBI::dbConnect(drv = bigquery(),
+                      project = "learnclinicaldatascience")
+```
+What criteria can be used to identify patients with hypertension? I will test the ability of different algorithms to pull out patients with hypertension from a large database of records. To do this, I am comparing which patients were selected by the algorithm with the patients manually diagnosed by experts examining the electronic health records. An ideal algorithm selects all the patients that the manual reviewers identified as having hypertension. 
+
+Hypertension is clinically defined as having Systolic blood pressure greater than 140 mmHg on more than two occasions, or Diastolic blood pressure higher than 90 mmHg on more than two occasions. It is reasonable to think that using these two rules will allow us to pull out patients with hypertension, but as seen below, that is not the case. One explanation is that patients can have elevated blood pressure in many conditions, not only because they are diagnosed with hypertension. 
+
+How good is an algorithm that uses lab measurements with the clinical threshold Systolic BP >= 140 mmHg or Diastolic BP>= 90 mmHg as criteria to classify hypertension patients?
+```{r labsthreshold, echo=FALSE}
+#find the event codes for Systolic BP and Diastolic BP in the CareVue and MedVision system
+d_items <-tbl(con, 'mimic3_demo.D_ITEMS')
+search_systolic_cv <- d_items %>% 
+  filter(lower(LABEL) %like% "%systolic%" & DBSOURCE == "carevue") %>%
+  select(ITEMID)
+search_systolic_cv <- as.tibble(search_systolic_cv)
+search_systolic_cv <- pull(search_systolic_cv,ITEMID)
+
+search_systolic_mv <-d_items %>% 
+  filter(lower(LABEL) %like% "%systolic%" & DBSOURCE == "metavision") %>%
+  select(ITEMID)
+search_systolic_mv <- as.tibble(search_systolic_mv)
+search_systolic_mv <- pull(search_systolic_mv,ITEMID)
+
+search_diastolic_cv <-d_items %>% 
+  filter(lower(LABEL) %like% "%diastolic%" & DBSOURCE == "carevue") %>%
+  select(ITEMID)
+search_diastolic_cv <- as.tibble(search_diastolic_cv)
+search_diastolic_cv <- pull(search_diastolic_cv,ITEMID)
+
+search_diastolic_mv <-d_items %>% 
+  filter(lower(LABEL) %like% "%diastolic%" & DBSOURCE == "carevue") %>%
+  select(ITEMID)
+search_diastolic_mv <- as.tibble(search_diastolic_mv)
+search_diastolic_mv <- pull(search_diastolic_mv,ITEMID)
+
+itemid_systolic <-append(search_systolic_cv, search_systolic_mv)
+itemid_diastolic <-append(search_diastolic_cv, search_diastolic_mv)
+
+#find patients that have systolic pressure measurement above threshold
+chartevents <- tbl(con, "mimic3_demo.CHARTEVENTS")
+patients_systolic_above_limit <- chartevents %>%
+  filter(ITEMID %in% itemid_systolic & VALUENUM>=140) %>%
+  group_by(SUBJECT_ID) %>%
+  summarise(systolic_2events = case_when(n()>=2 ~ 1,TRUE ~0)) %>%
+  select(SUBJECT_ID, systolic_2events)
+
+#evaluate the criterion "patients with hypertension are patients with 2 or more events of systolic blood pressure higher than 140" 
+training <- tbl(con, "course3_data.hypertension_goldstandard")
+training %<>%
+  left_join(patients_systolic_above_limit) %>%
+  mutate(systolic_2events = coalesce(systolic_2events, 0))
+train<-as_tibble(training)
+train$HYPERTENSION <- as.factor(as.vector(train$HYPERTENSION))
+train$systolic_2events <- as.factor(as.vector(train$systolic_2events))
+results_systolic <- confusionMatrix(train$systolic_2events,train$HYPERTENSION, positive = "1", dnn=c("systolic_2events","HYPERTENSION"))
+results_systolic
+#as.table(results_systolic)
+
+#find patients that have diastolic pressure measurement above threshold
+chartevents <- tbl(con, "mimic3_demo.CHARTEVENTS")
+patients_diastolic_above_limit <- chartevents %>%
+  filter(ITEMID %in% itemid_diastolic & VALUENUM>=90) %>%
+  group_by(SUBJECT_ID) %>%
+  summarise(diastolic_2events = case_when(n()>=2 ~ 1,TRUE ~0)) %>%
+  select(SUBJECT_ID, diastolic_2events)
+
+#evaluate the criterion "patients with hypertension are patients with 2 or more events of systolic blood pressure higher than 140" 
+training <- tbl(con, "course3_data.hypertension_goldstandard")
+training %<>%
+  left_join(patients_diastolic_above_limit) %>%
+  mutate(diastolic_2events = coalesce(diastolic_2events, 0))
+train<-as_tibble(training)
+train$HYPERTENSION <- as.factor(as.vector(train$HYPERTENSION))
+train$diastolic_2events <- as.factor(as.vector(train$diastolic_2events))
+results_diastolic <- confusionMatrix(train$diastolic_2events,train$HYPERTENSION, positive = "1", dnn=c("diastolic_2events","HYPERTENSION"))
+#as.table(results_diastolic)
+results_diastolic
+```
+
+How good is an algorithm that uses the ICD9 billing codes for essential hypertension as a criterion to classify patients with hypertension?
+
+```{r billingcodes, echo=FALSE}
+diagnoses_icd <- tbl(con, "mimic3_demo.DIAGNOSES_ICD")
+hypertension_codes <- diagnoses_icd %>% 
+  filter(ICD9_CODE %in% c("4010","4011","4019")) %>%
+  distinct(SUBJECT_ID) %>%
+  mutate(has_codes = 1)
+
+training <- tbl(con, "course3_data.hypertension_goldstandard")
+training %<>% 
+  left_join(hypertension_codes) %>% 
+  mutate(has_codes = coalesce(has_codes, 0))
+train <- as_tibble(training)
+train$HYPERTENSION <- as.factor(as.vector(train$HYPERTENSION))
+train$has_codes <- as.factor(as.vector(train$has_codes))
+results_hascodes <- confusionMatrix(train$has_codes,train$HYPERTENSION, positive = "1", dnn=c("has_hypertension_ICD9codes","HYPERTENSION"))
+as.table(results_hascodes)
+results_hascodes
+```
+How good is an algorithm that uses the ICD9 4019 billing code for essential hypertension? ICD9 code 4019 is the most often used code in this database. 
+
+```{r billingcodes4010, echo=FALSE}
+diagnoses_icd <- tbl(con, "mimic3_demo.DIAGNOSES_ICD")
+hypertension_codes <- diagnoses_icd %>% 
+  filter(ICD9_CODE %in% c("4019")) %>%
+  distinct(SUBJECT_ID) %>%
+  mutate(has_codes = 1)
+
+training <- tbl(con, "course3_data.hypertension_goldstandard")
+training %<>% 
+  left_join(hypertension_codes) %>% 
+  mutate(has_codes = coalesce(has_codes, 0))
+train <- as_tibble(training)
+train$HYPERTENSION <- as.factor(as.vector(train$HYPERTENSION))
+train$has_codes <- as.factor(as.vector(train$has_codes))
+results_hascodes <- confusionMatrix(train$has_codes,train$HYPERTENSION, positive = "1", dnn=c("has_hypertension_ICD9code401.9","HYPERTENSION"))
+results_hascodes
+```
+
+How good is an algorithm that classifies patients with hypertension because they were prescribed medications commonly used to treat hypertension? As you can see below, many of the patients with hypertension were prescribed these drugs, however the problem is that many other patients were prescribed anti hypertensives for other reasons. 
+
+```{r prescriptions, echo=FALSE}
+#get the list of commonly used antihypertensive drugs
+d_antihypertensives <- tbl(con, "course3_data.D_ANTIHYPERTENSIVES")
+prescriptions <- tbl(con,"mimic3_demo.PRESCRIPTIONS")
+
+has_prescriptions <- prescriptions %>%
+  right_join(d_antihypertensives) %>%
+  filter (!is.na(ROW_ID)) %>%
+  mutate(has_drug=1) %>%
+  group_by(SUBJECT_ID) %>%
+  summarise(has_drug=max(has_drug, na.rm=TRUE)) %>%
+  select (SUBJECT_ID,has_drug)
+training <- tbl(con, "course3_data.hypertension_goldstandard")
+training %<>% 
+  left_join(has_prescriptions) %>% 
+  mutate(has_drug = coalesce(has_drug, 0))
+train <- as_tibble(training)
+train$HYPERTENSION <- as.factor(as.vector(train$HYPERTENSION))
+train$has_drug <- as.factor(as.vector(train$has_drug))
+results_hasdrug <- confusionMatrix(train$has_drug,train$HYPERTENSION, positive = "1", dnn=c("has_hypertension_drugs","HYPERTENSION"))
+results_hasdrug
+```
+
+How good is an algorithm that classifies patients with hypertension because they were prescribed medications commonly used to treat hypertension ten or more times? Here I'm trying to improve the Specificity of the algorithm by screening out patients that might have been prescribed these drugs for other conditions a few times. 
+
+```{r medicationrecords, echo=FALSE}
+#get the list of commonly used antihypertensive drugs
+d_antihypertensives <- tbl(con, "course3_data.D_ANTIHYPERTENSIVES")
+prescriptions <- tbl(con,"mimic3_demo.PRESCRIPTIONS")
+
+has_prescriptions <- prescriptions %>%
+  right_join(d_antihypertensives) %>%
+  filter (!is.na(ROW_ID)) %>%
+  mutate(drugflag=1) %>%
+  group_by(SUBJECT_ID) %>%
+  summarise(drugflag=sum(drugflag,na.rm = TRUE)) %>%
+  filter(drugflag>=10) %>%
+  mutate (has_drug = 1) %>%
+  select (SUBJECT_ID,has_drug)
+
+training <- tbl(con, "course3_data.hypertension_goldstandard")
+training %<>% 
+  left_join(has_prescriptions) %>% 
+  mutate(has_drug = coalesce(has_drug, 0))
+train <- as_tibble(training)
+train$HYPERTENSION <- as.factor(as.vector(train$HYPERTENSION))
+train$has_drug <- as.factor(as.vector(train$has_drug))
+results_hasdrug <- confusionMatrix(train$has_drug,train$HYPERTENSION, positive = "1", dnn=c("has_hypertension_drugs","HYPERTENSION"))
+results_hasdrug
+```
+
+How good is an algorithm that classifies patients with hypertension based on medication records showing they were prescribed an anti-hypertensive and they had an ICD9 billing code for hypertension? 
+
+```{r twocombinations, echo=FALSE}
+#get the list of commonly used antihypertensive drugs
+d_antihypertensives <- tbl(con, "course3_data.D_ANTIHYPERTENSIVES")
+prescriptions <- tbl(con,"mimic3_demo.PRESCRIPTIONS")
+
+has_prescriptions <- prescriptions %>%
+  right_join(d_antihypertensives) %>%
+  filter (!is.na(ROW_ID)) %>%
+  mutate(has_drug=1) %>%
+  group_by(SUBJECT_ID) %>%
+  summarise(has_drug=max(has_drug,na.rm = TRUE)) %>%
+  select (SUBJECT_ID,has_drug)
+
+diagnoses_icd <- tbl(con, "mimic3_demo.DIAGNOSES_ICD")
+hypertension_codes <- diagnoses_icd %>% 
+  filter(ICD9_CODE %in% c("4010","4011","4019")) %>%
+  distinct(SUBJECT_ID) %>%
+  mutate(has_codes = 1)
+
+training <- tbl(con, "course3_data.hypertension_goldstandard")
+training %<>% 
+  left_join(has_prescriptions) %>% 
+  left_join(hypertension_codes) %>%
+  mutate(has_drug = coalesce(has_drug, 0)) %>%
+  mutate(has_codes =coalesce(has_codes,0)) %>%
+  mutate(has_drug_and_codes = case_when(has_drug == 1 &&
+                                          has_codes == 1 ~ 1, TRUE ~ 0))
+train <- as_tibble(training)
+train$HYPERTENSION <- as.factor(as.vector(train$HYPERTENSION))
+train$has_drug_and_codes <- as.factor(as.vector(train$has_drug_and_codes))
+results <- confusionMatrix(train$has_drug_and_codes,train$HYPERTENSION, positive = "1", dnn=c("has_drug_and_codes","HYPERTENSION"))
+results
+```
+How good is an algorithm that classifies patients with hypertension because they were prescribed an anti-hypertensive and had two diastolic measurements above 90mmHg ?
+
+```{r drugsdiastolic, echo=FALSE}
+#get the list of commonly used antihypertensive drugs
+d_antihypertensives <- tbl(con, "course3_data.D_ANTIHYPERTENSIVES")
+prescriptions <- tbl(con,"mimic3_demo.PRESCRIPTIONS")
+
+has_prescriptions <- prescriptions %>%
+  right_join(d_antihypertensives) %>%
+  filter (!is.na(ROW_ID)) %>%
+  mutate(has_drug=1) %>%
+  group_by(SUBJECT_ID) %>%
+  summarise(has_drug=max(has_drug,na.rm = TRUE)) %>%
+  select (SUBJECT_ID,has_drug)
+
+diagnoses_icd <- tbl(con, "mimic3_demo.DIAGNOSES_ICD")
+hypertension_codes <- diagnoses_icd %>% 
+  filter(ICD9_CODE %in% c("4010","4011","4019")) %>%
+  distinct(SUBJECT_ID) %>%
+  mutate(has_codes = 1)
+
+d_items <-tbl(con, 'mimic3_demo.D_ITEMS')
+search_diastolic_cv <-d_items %>% 
+  filter(lower(LABEL) %like% "%diastolic%" & DBSOURCE == "carevue") %>%
+  select(ITEMID)
+search_diastolic_cv <- as.tibble(search_diastolic_cv)
+search_diastolic_cv <- pull(search_diastolic_cv,ITEMID)
+search_diastolic_mv <-d_items %>% 
+  filter(lower(LABEL) %like% "%diastolic%" & DBSOURCE == "carevue") %>%
+  select(ITEMID)
+search_diastolic_mv <- as.tibble(search_diastolic_mv)
+search_diastolic_mv <- pull(search_diastolic_mv,ITEMID)
+itemid_diastolic <-append(search_diastolic_cv, search_diastolic_mv)
+#find patients that have diastolic pressure measurement above threshold
+chartevents <- tbl(con, "mimic3_demo.CHARTEVENTS")
+patients_diastolic_above_limit <- chartevents %>%
+  filter(ITEMID %in% itemid_diastolic & VALUENUM>=90) %>%
+  group_by(SUBJECT_ID) %>%
+  summarise(diastolic_2events = case_when(n()>=2 ~ 1,TRUE ~0)) %>%
+  select(SUBJECT_ID, diastolic_2events)
+
+training <- tbl(con, "course3_data.hypertension_goldstandard")
+training %<>% 
+  left_join(has_prescriptions) %>% 
+  left_join(hypertension_codes) %>%
+  left_join(patients_diastolic_above_limit) %>%
+  mutate(has_drug = coalesce(has_drug, 0)) %>%
+  mutate(has_codes = coalesce(has_codes,0)) %>%
+  mutate(diastolic_2events = coalesce(diastolic_2events,0)) %>%
+  mutate(has_drug_and_diastolic = case_when(has_drug == 1 &&
+                                         diastolic_2events == 1 ~ 1, TRUE ~ 0)) %>%
+  mutate(has_diastolic_and_codes = case_when(diastolic_2events == 1 &&
+                                         has_codes == 1 ~ 1, TRUE ~ 0))
+train <- as_tibble(training)
+train$HYPERTENSION <- as.factor(as.vector(train$HYPERTENSION))
+train$has_drug_and_diastolic <- as.factor(as.vector(train$has_drug_and_diastolic))
+train$has_diastolic_and_codes <- as.factor(as.vector(train$has_diastolic_and_codes))
+results <- confusionMatrix(train$has_drug_and_diastolic,train$HYPERTENSION, positive = "1", dnn=c("has_drug_and_diastolic","HYPERTENSION"))
+results
+```
+
+Summary
+
+As expected and seen in the graph below, there is a trade of between the ability of the algorithms to identify all patients with hypertension (True Positive Rate) and to classify other patients mistakenly as having hypertension. Using all ICD9 codes associated with hypertension as a selection criteria seems to be a good start, though much improvement is needed. 
+
+Future steps are testing these criteria on a new test population to make sure we did not over fit to our current data and improving our models. Random forest approaches are particularly good at classification, however, they do require more labeled data (manually sorted records) to be trained. 
+
+```{r graphresults, echo=FALSE}
+models <- c("systolic2events", "diastolic2events", "all_ICDcode",	"4019_ICDcode",	"anyDrug", "anyDrug10times",	"anyDrug_andICDcode", "anyDrug_diastolic2events")
+y <- c(0.7143, 0.09524, 0.5556, 0.5238, 0.8254, 0.2857, 0.5079, 0.07937) #Sensitivity
+x <- c(0.5,	0.19444,	0.0833,	0.0833,	0.6667,	0.1667,	0.0833,	0.13889) #1-Specificity
+modelresult <- data.frame(x=c(0.5,	0.19444,	0.0833,	0.0833,	0.6667,	0.1667,	0.0833,	0.13889), y= c(0.7143, 0.09524, 0.5556, 0.5238, 0.8254, 0.2857, 0.5079, 0.07937))
+
+library(ggplot2)
+library(ggrepel)
+roc <- ggplot(modelresult, aes(x=x, y=y)) + geom_point() + xlab("False Positive Rate") + ylab("True Positive Rate")
+roc + geom_label_repel(aes(label = models),
+                  box.padding   = 0.35, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50') +
+  theme_classic()
+```
+
